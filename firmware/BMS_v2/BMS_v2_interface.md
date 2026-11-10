@@ -55,3 +55,26 @@ work on the USB serial port at 115200 (add `HELP`).
 | `ROTATE [0-3]` | display rotation (saved); no argument flips 180° |
 | `PAGE MAIN\|DEBUG` | switch screen page |
 | `VE [RAW on\|off]` | USB serial only: VE.Direct counters and field ages; RAW echoes every line received |
+
+## Tabasco link (HMI panels)
+
+Alongside the JSON, the board speaks the encrypted Tabasco link used by the HMI panels
+(`Modules/Common/tabasco_link`, copied into this sketch as `tb_*.c` / `tb_*.h`; run `Modules/Common/sync_common.sh`
+after changing the shared files). AES-128-GCM with a network key shared by every node; frames carry a boot number
+and counter, so old frames can't be replayed.
+
+- DATA: every value in `tb_signals.h` (BMS list), changes at most every 200 ms and a full refresh every 5 s.
+- TEXT: the status line, when it changes and every 5 s.
+- BMS_MODULE: one module's cells and temperatures every 125 ms, only while a panel is showing the Battery page.
+- Commands from the panels: CMU power, contactor, balance, fans, rerun naming. Each is answered with an ACK as soon as
+  it's checked (before it runs, since power-on and naming take seconds); a repeated command is answered again but not
+  run twice.
+
+Unencrypted ESP-NOW commands that switch something (POWER, CONTACTOR, FAN, BAL, NAME, ...) are now refused
+(`unencrypted_control_refused`); STATUS, GET and MODULE still work. While an old TabascoMaster panel still needs
+to control the BMS, type `PLAINCMD ON` on USB serial (saved; `PLAINCMD OFF` to lock it again).
+
+USB serial: `NETKEY` shows the link counters; `NETKEY <32 hex digits>` sets the network key (must match the TIM and
+every panel).
+
+ESP-NOW receive now queues up to 8 packets instead of dropping everything that arrives while one command waits.

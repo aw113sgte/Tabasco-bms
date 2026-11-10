@@ -2,3 +2,4 @@ build/
 *.bin
 *.elf
 .vscode/
+firmware/BMS_v2/tb_netkey.h
