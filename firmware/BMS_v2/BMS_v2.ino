@@ -3,6 +3,7 @@
 // Pin map: pcb_v2/REVIEW.md and pcb_v2/gen/design.py.
 // CMU naming and CAN handling are ported from StamPLC_SCIB.ino (validated 16-CMU timing, see cmucoms.md).
 // Remote link: ESP-NOW on Wi-Fi channel 1 (see BMS_v2_interface.md). The same commands work on USB serial.
+// The HMI panels use the encrypted Tabasco link (tb_*.c / tb_*.h, copied from Modules/Common/tabasco_link).
 
 #include <Arduino.h>
 #include <algorithm>
@@ -23,6 +24,10 @@
 #include "esp_err.h"
 #include "freertos/FreeRTOS.h"
 #include "rom/ets_sys.h"
+#include "freertos/queue.h"
+#include "tb_msgs.h"
+#include "tb_netkey.h"
+#include "tb_signals.h"
 
 using SCIBCMUComs::CommandFamily;
 using SCIBCMUComs::Manager;
@@ -153,6 +158,7 @@ struct AppConfig {
   CommandFamily family = CommandFamily::Family0A;
   uint8_t rotation = 1;
   uint8_t backlightPct = 100;
+  bool plainNowControl = false;  // accept unencrypted ESP-NOW control commands (POWER, CONTACTOR, ...)
 };
 
 struct NamingReply {
@@ -301,10 +307,12 @@ struct ReplyTarget {
   uint8_t mac[6] = {0};
 };
 
-struct PendingEspNowCommand {
-  volatile bool ready = false;
-  uint8_t mac[6] = {0};
-  char text[160] = {0};
+// One received ESP-NOW packet: a plain-text command or a Tabasco link frame. Queued by the receive callback
+// (Wi-Fi task) and handled in loop(), so a burst of packets is no longer reduced to the first one.
+struct NowRxItem {
+  uint8_t mac[6];
+  uint8_t len;
+  uint8_t data[250];
 };
 
 // ------------------------------------------------------------------ globals
@@ -319,7 +327,8 @@ AppConfig g_config;
 VEDirectLive g_veLive;
 VEDirectPending g_vePending;
 VEDirectDiag g_veDiag;
-PendingEspNowCommand g_pendingNow;
+QueueHandle_t g_nowRxq = nullptr;
+uint32_t g_nowRxDropped = 0;
 
 TempProbe g_probes[2] = {{kPinTemp1, "Batt"}, {kPinTemp2, "Air"}};
 Fan g_fans[2] = {{kPinFan1Pwm, kPinFan1Tach}, {kPinFan2Pwm, kPinFan2Tach}};
@@ -465,6 +474,7 @@ static void loadConfig() {
   const uint8_t familyRaw = g_prefs.getUChar("family", static_cast<uint8_t>(CommandFamily::Family0A));
   g_config.rotation = g_prefs.getUChar("rot", 1) == 3 ? 3 : 1;  // landscape only: 1, or 3 for upside down
   g_config.backlightPct = g_prefs.getUChar("bl", 100);
+  g_config.plainNowControl = g_prefs.getBool("plaincmd", false);
   g_prefs.end();
 
   if (familyRaw == static_cast<uint8_t>(CommandFamily::Family09)) {
@@ -487,6 +497,7 @@ static void saveConfig() {
   g_prefs.putUChar("family", static_cast<uint8_t>(g_config.family));
   g_prefs.putUChar("rot", g_config.rotation);
   g_prefs.putUChar("bl", g_config.backlightPct);
+  g_prefs.putBool("plaincmd", g_config.plainNowControl);
   g_prefs.end();
 }
 
@@ -1949,6 +1960,280 @@ static void sendModuleTo(const ReplyTarget& to, uint8_t moduleNo) {
   }
 }
 
+// ------------------------------------------------------------------ Tabasco link (HMI panels)
+// Encrypted, compact frames (Modules/Common/tabasco_link): DATA (every value, deltas at most every 200 ms and a
+// full refresh every 5 s), TEXT (the status line), BMS_MODULE (one module's cells, only while a panel shows them),
+// commands with an ACK. The JSON broadcasts carry on for other listeners.
+static tb_link_t g_tb;
+static tb_pub_t g_tbPub;
+static tb_subs_t g_tbSubs;
+static tb_cmd_dedup_t g_tbDedup;
+static bool g_tbReady = false;
+static bool g_tbDefaultKey = true;
+static uint32_t g_tbCommands = 0;
+static Preferences g_tbPrefs;
+
+static bool tbKeyIsDefault() {
+  return g_tbDefaultKey;
+}
+
+static bool tbSetKeyHex(const char* hex) {
+  uint8_t key[TB_KEY_LEN];
+  if (!tb_key_from_hex(hex, key)) {
+    return false;
+  }
+  g_tbPrefs.putBytes("key", key, TB_KEY_LEN);
+  memcpy(g_tb.key, key, TB_KEY_LEN);
+  g_tbDefaultKey = false;
+  return true;
+}
+
+static void tbInit() {
+  g_tbPrefs.begin("tblink", false);
+  // The boot number goes into every frame's nonce and must never repeat with the same key.
+  const uint16_t boot = static_cast<uint16_t>(g_tbPrefs.getUShort("boot", static_cast<uint16_t>(esp_random())) + 1);
+  g_tbPrefs.putUShort("boot", boot);
+  uint8_t key[TB_KEY_LEN];
+  if (g_tbPrefs.getBytesLength("key") == TB_KEY_LEN) {
+    g_tbPrefs.getBytes("key", key, TB_KEY_LEN);
+    g_tbDefaultKey = false;
+  } else {
+    tb_key_from_hex(TB_DEFAULT_NETKEY_HEX, key);
+  }
+  uint8_t mac[6];
+  esp_wifi_get_mac(WIFI_IF_STA, mac);
+  tb_link_init(&g_tb, key, mac, TB_NODE_BMS, boot);
+  tb_pub_init(&g_tbPub, TB_NODE_BMS);
+  g_tbReady = g_espNowReady;
+  Serial.printf("[BMS] Tabasco link: boot %u, %s key, unencrypted control %s\n", boot,
+                g_tbDefaultKey ? "default" : "custom", g_config.plainNowControl ? "ACCEPTED" : "refused");
+}
+
+static void tbSend(uint8_t kind, uint8_t flags, const uint8_t* body, size_t len) {
+  uint8_t frame[TB_MAX_FRAME];
+  const size_t n = tb_link_seal(&g_tb, kind, flags, body, len, frame);
+  if (n == 0 || !ensurePeer(kBroadcastMac) || esp_now_send(kBroadcastMac, frame, n) != ESP_OK) {
+    g_espNowTxFail++;
+    return;
+  }
+  g_espNowTx++;
+}
+
+static void tbAck(const uint8_t mac[6], uint16_t cmdId, uint8_t result) {
+  tb_ack_msg_t a;
+  memcpy(a.to_mac, mac, 6);
+  a.cmd_id = cmdId;
+  a.result = result;
+  uint8_t body[16];
+  const size_t n = tb_ack_put(body, sizeof(body), &a);
+  if (n) {
+    tbSend(TB_KIND_ACK, 0, body, n);
+  }
+}
+
+// Checks a command and answers it. The ACK goes out before the command runs, because CMU power and naming
+// block for several seconds and the panel would give up waiting.
+static void tbHandleCmd(const uint8_t mac[6], const uint8_t* body, size_t len) {
+  tb_cmd_msg_t c;
+  if (!tb_cmd_get(body, len, &c) || c.target != TB_NODE_BMS || c.target_boot != g_tb.boot) {
+    return;  // not for us, or meant for an earlier run of this board (or a replay of one)
+  }
+  uint8_t result;
+  if (tb_cmd_seen(&g_tbDedup, mac, c.cmd_id, &result)) {
+    tbAck(mac, c.cmd_id, result);  // a retry: the answer got lost, the command already ran
+    return;
+  }
+  g_tbCommands++;
+  const bool on = c.arg != 0;
+  const uint8_t fan = static_cast<uint8_t>((c.arg >> 8) & 0xFF);
+  const int pct = c.arg & 0xFF;
+  switch (c.cmd) {
+    case TB_CMD_BMS_POWER:
+    case TB_CMD_BMS_CONTACTOR:
+    case TB_CMD_BMS_BALANCE:
+      result = (c.arg == 0 || c.arg == 1) ? TB_ACK_OK : TB_ACK_BAD_ARG;
+      break;
+    case TB_CMD_BMS_FAN:
+      result = (fan <= 2 && pct <= 100) ? TB_ACK_OK : TB_ACK_BAD_ARG;
+      break;
+    case TB_CMD_BMS_RENAME:
+      result = g_commPowerOn && !g_namingInProgress ? TB_ACK_OK : TB_ACK_REFUSED;
+      break;
+    default:
+      result = TB_ACK_UNKNOWN;
+      break;
+  }
+  tb_cmd_remember(&g_tbDedup, mac, c.cmd_id, result);
+  tbAck(mac, c.cmd_id, result);
+  if (result != TB_ACK_OK) {
+    return;
+  }
+  Serial.printf("[BMS] panel %02X:%02X:%02X:%02X:%02X:%02X: command %u arg %ld\n", mac[0], mac[1], mac[2], mac[3],
+                mac[4], mac[5], c.cmd, static_cast<long>(c.arg));
+  switch (c.cmd) {
+    case TB_CMD_BMS_POWER:
+      setCommPower(on);
+      break;
+    case TB_CMD_BMS_CONTACTOR:
+      setContactorEnabled(on);
+      break;
+    case TB_CMD_BMS_BALANCE:
+      g_config.balanceAllEnabled = on;
+      saveConfig();
+      if (g_cmuActive) {
+        g_cmu.setBalanceAllEnabled(on);
+      }
+      setStatus("Balance all %s", on ? "ON" : "OFF");
+      break;
+    case TB_CMD_BMS_FAN:
+      if (fan == 0 || fan == 1) setFanPct(0, pct);
+      if (fan == 0 || fan == 2) setFanPct(1, pct);
+      break;
+    case TB_CMD_BMS_RENAME:
+      runNamingNow();
+      break;
+  }
+  g_tbPub.force_full = true;  // every panel sees the new state straight away
+}
+
+static void tbHandleFrame(const NowRxItem& item) {
+  if (!g_tbReady) {
+    return;
+  }
+  tb_header_t h;
+  uint8_t body[TB_MAX_BODY];
+  size_t blen = 0;
+  if (!tb_link_open(&g_tb, item.mac, item.data, item.len, millis(), &h, body, &blen)) {
+    return;
+  }
+  if (h.kind == TB_KIND_SUB) {
+    tb_sub_msg_t sub;
+    if (tb_sub_get(body, blen, &sub)) {
+      tb_subs_note(&g_tbSubs, item.mac, &sub, millis());
+    }
+  } else if (h.kind == TB_KIND_CMD) {
+    tbHandleCmd(item.mac, body, blen);
+  }
+}
+
+static int32_t probeDeciF(const TempProbe& p) {
+  return static_cast<int32_t>(lroundf(cToF(p.tempC) * 10.0f));
+}
+
+static void tbPublishData() {
+  const SummaryView v = buildSummaryView();
+  int32_t val[TB_BMS_COUNT] = {0};
+  bool ok[TB_BMS_COUNT] = {false};
+  auto put = [&](uint8_t id, int32_t x, bool valid) {
+    val[id] = x;
+    ok[id] = valid;
+  };
+  const bool modules = v.canCount > 0;
+  put(TB_BMS_CMUS_UART, v.uartCount, true);
+  put(TB_BMS_CMUS_CAN, v.canCount, true);
+  put(TB_BMS_MOD_V_HI, v.moduleHighMv, v.moduleHighMv >= 0);
+  put(TB_BMS_MOD_V_AVG, v.moduleAvgMv, v.moduleAvgMv >= 0);
+  put(TB_BMS_MOD_V_LO, v.moduleLowMv, v.moduleLowMv >= 0);
+  put(TB_BMS_T_HI, v.tempHighDeciF, modules && v.tempHighDeciF != -1);
+  put(TB_BMS_T_AVG, v.tempAvgDeciF, modules && v.tempAvgDeciF != -1);
+  put(TB_BMS_T_LO, v.tempLowDeciF, modules && v.tempLowDeciF != -1);
+  put(TB_BMS_DELTA_MAX, v.maxDeltaMv, modules);
+  put(TB_BMS_SOC, v.socDeciPct, v.socValid);
+  put(TB_BMS_CURRENT, v.currentMa, v.currentValid);
+  put(TB_BMS_BATT_V, v.batteryMv, v.batteryValid);
+  put(TB_BMS_POWER, g_commPowerOn ? 1 : 0, true);
+  put(TB_BMS_CONTACTOR, g_contactorEnabled ? 1 : 0, true);
+  put(TB_BMS_EMS_LED, g_emsLedOn ? 1 : 0, true);
+  put(TB_BMS_BAL_ALL, g_config.balanceAllEnabled ? 1 : 0, true);
+  put(TB_BMS_T_BOARD, isnan(g_probes[0].tempC) ? 0 : probeDeciF(g_probes[0]), !isnan(g_probes[0].tempC));
+  put(TB_BMS_T_AIR, isnan(g_probes[1].tempC) ? 0 : probeDeciF(g_probes[1]), !isnan(g_probes[1].tempC));
+  put(TB_BMS_FAN1_PCT, g_fans[0].pct, true);
+  put(TB_BMS_FAN2_PCT, g_fans[1].pct, true);
+  put(TB_BMS_FAN1_RPM, g_fans[0].rpm, true);
+  put(TB_BMS_FAN2_RPM, g_fans[1].rpm, true);
+  put(TB_BMS_V24, g_vmonMv, true);
+  uint8_t body[TB_MAX_BODY];
+  uint8_t flags = 0;
+  const size_t n = tb_pub_build(&g_tbPub, val, ok, millis(), body, sizeof(body), &flags);
+  if (n) {
+    tbSend(TB_KIND_DATA, flags, body, n);
+  }
+}
+
+static void tbPublishText() {
+  static char last[sizeof(g_statusLine)] = {0};
+  static uint32_t lastMs = 0;
+  const bool changed = strcmp(last, g_statusLine) != 0;
+  if (!(changed && millis() - lastMs >= 500) && millis() - lastMs < 5000) {
+    return;
+  }
+  strlcpy(last, g_statusLine, sizeof(last));
+  lastMs = millis();
+  uint8_t body[1 + sizeof(g_statusLine)];
+  body[0] = TB_BMS_TEXT_STATUS;
+  const size_t n = strlen(last);
+  memcpy(body + 1, last, n);
+  tbSend(TB_KIND_TEXT, 0, body, 1 + n);
+}
+
+// While a panel shows the Battery page: one module every 125 ms, so all 16 every 2 s.
+static void tbPublishModules(uint16_t wanted) {
+  static uint8_t next = 1;
+  static uint32_t lastMs = 0;
+  if (!wanted || !g_cmuActive || millis() - lastMs < 125) {
+    return;
+  }
+  lastMs = millis();
+  const uint8_t slots = kMaxModules < TB_BMS_MODULES ? kMaxModules : TB_BMS_MODULES;
+  for (uint8_t tries = 0; tries < slots; ++tries) {
+    const uint8_t slot = next;
+    next = next >= slots ? 1 : next + 1;
+    const ModuleData* module = g_cmu.module(slot);
+    if (!(wanted & (1u << (slot - 1))) || !module || !module->discovered) {
+      continue;
+    }
+    tb_bms_module_t m;
+    memset(&m, 0, sizeof(m));
+    m.slot = slot;
+    m.can = module->canModuleNo;
+    m.online = module->online;
+    m.status_word = module->statusWord;
+    float totalV = NAN, avgCellV = NAN, avgTempF = NAN;
+    uint16_t deltaMv = 0;
+    uint8_t validCells = 0, validTemps = 0;
+    const bool metrics = g_cmu.moduleMetrics(slot, totalV, avgCellV, deltaMv, avgTempF, validCells, validTemps);
+    m.total_mv = metrics ? static_cast<int32_t>(lroundf(totalV * 1000.0f)) : -1;
+    m.delta_mv = metrics ? deltaMv : -1;
+    m.avg_temp_df = (metrics && !isnan(avgTempF)) ? static_cast<int32_t>(lroundf(avgTempF * 10.0f)) : INT32_MIN;
+    m.ncells = kCellsPerModule < TB_BMS_CELLS ? kCellsPerModule : TB_BMS_CELLS;
+    for (uint8_t i = 0; i < m.ncells; ++i) {
+      m.cells_mv[i] = module->cellValid[i] ? static_cast<int16_t>(module->cells_mV[i]) : -1;
+    }
+    m.ntemps = kTempsPerModule < TB_BMS_TEMPS ? kTempsPerModule : TB_BMS_TEMPS;
+    for (uint8_t i = 0; i < m.ntemps; ++i) {
+      m.temps_df[i] = (module->tempValid[i] && !isnan(module->temps_C[i]))
+                          ? static_cast<int16_t>(lroundf(SCIBCMUComs::Manager::cToF(module->temps_C[i]) * 10.0f))
+                          : INT16_MIN;
+    }
+    uint8_t body[TB_MAX_BODY];
+    const size_t n = tb_bms_module_put(body, sizeof(body), &m);
+    if (n) {
+      tbSend(TB_KIND_BMS_MODULE, 0, body, n);
+    }
+    return;
+  }
+}
+
+static void serviceTabascoLink() {
+  if (!g_tbReady || g_namingInProgress) {
+    return;
+  }
+  tbPublishData();
+  tbPublishText();
+  const tb_sub_msg_t sub = tb_subs_active(&g_tbSubs, millis());
+  tbPublishModules((sub.mask & TB_SUB_BMS_MODULES) ? sub.module_mask : 0);
+}
+
 static void processCommand(char* command, const ReplyTarget& to) {
   for (char* p = command; *p; ++p) {
     if (*p == '\r' || *p == '\n') {
@@ -2187,10 +2472,36 @@ static void processCommand(char* command, const ReplyTarget& to) {
     return;
   }
 
+  if (strcasecmp(verb, "PLAINCMD") == 0 && !to.espnow) {
+    bool value = false;
+    if (isTruthyToken(strtok_r(nullptr, " \t", &savePtr), g_config.plainNowControl, value)) {
+      g_config.plainNowControl = value;
+      saveConfig();
+    }
+    Serial.printf("Unencrypted ESP-NOW control commands: %s\n", g_config.plainNowControl ? "ACCEPTED" : "refused");
+    return;
+  }
+
+  if (strcasecmp(verb, "NETKEY") == 0 && !to.espnow) {
+    const char* token = strtok_r(nullptr, " \t", &savePtr);
+    if (token && !tbSetKeyHex(token)) {
+      Serial.println("NETKEY needs exactly 32 hex digits");
+      return;
+    }
+    Serial.printf("Tabasco link: %s key, boot %u, sent %lu, received ok %lu, wrong key/damaged %lu, replayed %lu, "
+                  "commands %lu, queue drops %lu\n",
+                  tbKeyIsDefault() ? "built-in default" : "custom", g_tb.boot, static_cast<unsigned long>(g_tb.tx),
+                  static_cast<unsigned long>(g_tb.rx_ok), static_cast<unsigned long>(g_tb.rx_bad),
+                  static_cast<unsigned long>(g_tb.rx_replay), static_cast<unsigned long>(g_tbCommands),
+                  static_cast<unsigned long>(g_nowRxDropped));
+    return;
+  }
+
   if (strcasecmp(verb, "HELP") == 0 && !to.espnow) {
     Serial.println(
         "STATUS | MODULE n | POWER on|off|toggle | CONTACTOR on|off|toggle | FAN 1|2|ALL pct | BAL on|off |"
-        " KEEP on|off | FAMILY AUTO|09|0A | TEMPOFFSET c | NAME | SCREEN on|off | FLIP [on|off] | PAGE MAIN|DEBUG | VE [RAW on|off]");
+        " KEEP on|off | FAMILY AUTO|09|0A | TEMPOFFSET c | NAME | SCREEN on|off | FLIP [on|off] | PAGE MAIN|DEBUG | VE [RAW on|off] |"
+        " NETKEY [32 hex digits] | PLAINCMD on|off");
     return;
   }
 
@@ -2198,17 +2509,19 @@ static void processCommand(char* command, const ReplyTarget& to) {
 }
 
 static void onEspNowRecv(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
-  if (g_pendingNow.ready || len <= 0 || !info) {
+  if (len <= 0 || len > 250 || !info || !g_nowRxq) {
     return;
   }
   if (data[0] == '{') {
     return;  // another node's JSON, not a command
   }
-  const size_t n = min(static_cast<size_t>(len), sizeof(g_pendingNow.text) - 1);
-  memcpy(g_pendingNow.text, data, n);
-  g_pendingNow.text[n] = '\0';
-  memcpy(g_pendingNow.mac, info->src_addr, 6);
-  g_pendingNow.ready = true;
+  NowRxItem item;
+  memcpy(item.mac, info->src_addr, 6);
+  item.len = static_cast<uint8_t>(len);
+  memcpy(item.data, data, len);
+  if (xQueueSend(g_nowRxq, &item, 0) != pdTRUE) {
+    g_nowRxDropped++;
+  }
 }
 
 static void initEspNow() {
@@ -2227,24 +2540,48 @@ static void initEspNow() {
                 static_cast<unsigned>(kEspNowChannel), WiFi.macAddress().c_str());
 }
 
+// Commands that only read are always accepted unencrypted; anything that switches something needs the
+// encrypted link (or PLAINCMD ON, e.g. while an old TabascoMaster panel is still in use).
+static bool plainCommandAllowed(const char* text) {
+  char verb[16];
+  size_t i = 0;
+  while (text[i] && text[i] != ' ' && text[i] != '\t' && i < sizeof(verb) - 1) {
+    verb[i] = text[i];
+    i++;
+  }
+  verb[i] = '\0';
+  return g_config.plainNowControl || strcasecmp(verb, "STATUS") == 0 || strcasecmp(verb, "GET") == 0 ||
+         strcasecmp(verb, "MODULE") == 0 || strcasecmp(verb, "HELP") == 0;
+}
+
 static void serviceEspNowCommand() {
-  if (!g_pendingNow.ready) {
-    return;
+  NowRxItem item;
+  // A handful per loop pass, so a flood can't starve the CMU and display work.
+  for (int k = 0; k < 6 && g_nowRxq && xQueueReceive(g_nowRxq, &item, 0) == pdTRUE; ++k) {
+    g_espNowRx++;
+    g_espNowLastRxMs = millis();
+    if (tb_is_frame(item.data, item.len)) {
+      tbHandleFrame(item);
+      continue;
+    }
+    char text[161];
+    const size_t n = min(static_cast<size_t>(item.len), sizeof(text) - 1);
+    memcpy(text, item.data, n);
+    text[n] = '\0';
+    ReplyTarget to;
+    to.espnow = true;
+    memcpy(to.mac, item.mac, 6);
+    if (strncasecmp(text, "MASTER_HELLO", 12) == 0) {
+      continue;
+    }
+    Serial.printf("[BMS] NOW cmd from %02X:%02X:%02X:%02X:%02X:%02X: %s\n", to.mac[0], to.mac[1], to.mac[2],
+                  to.mac[3], to.mac[4], to.mac[5], text);
+    if (!plainCommandAllowed(text)) {
+      sendAck(to, "CMD", false, "unencrypted_control_refused");
+      continue;
+    }
+    processCommand(text, to);
   }
-  char text[sizeof(g_pendingNow.text)];
-  ReplyTarget to;
-  to.espnow = true;
-  memcpy(text, g_pendingNow.text, sizeof(text));
-  memcpy(to.mac, g_pendingNow.mac, 6);
-  g_pendingNow.ready = false;
-  g_espNowRx++;
-  g_espNowLastRxMs = millis();
-  if (strncasecmp(text, "MASTER_HELLO", 12) == 0) {
-    return;
-  }
-  Serial.printf("[BMS] NOW cmd from %02X:%02X:%02X:%02X:%02X:%02X: %s\n", to.mac[0], to.mac[1], to.mac[2], to.mac[3],
-                to.mac[4], to.mac[5], text);
-  processCommand(text, to);
 }
 
 static void serviceSerialCommand() {
@@ -2319,7 +2656,9 @@ void setup() {
   Serial.printf("[BMS] naming UART RX=%d TX=%d 1200 8E1, VE UART RX=%d TX=%d 19200 8N1\n", kNamingRxPin, kNamingTxPin,
                 kVEDirectRxPin, kVEDirectTxPin);
 
+  g_nowRxq = xQueueCreate(8, sizeof(NowRxItem));
   initEspNow();
+  tbInit();
   g_lastInteractionMs = millis();
   setPersistentStatus("Ready: B power, C contactor, hold A debug");
   drawScreen();
@@ -2361,6 +2700,7 @@ void loop() {
     g_lastBroadcastMs = millis();
   }
 
+  serviceTabascoLink();
   serviceSerialReport();
   delay(5);
 }
